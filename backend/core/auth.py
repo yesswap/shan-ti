@@ -179,3 +179,46 @@ def get_optional_user(
         return get_current_user(request, raw_key, db)
     except HTTPException:
         return None
+
+
+def _is_web_request(request: Request) -> bool:
+    """True when the request originates from our own web app (browser sends an
+    Origin/Referer header). Used to let users browse the site freely while
+    still gating programmatic API access behind an API key."""
+    allowed = [
+        o.strip().rstrip("/")
+        for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+        if o.strip()
+    ]
+    origin = request.headers.get("origin")
+    if origin and origin.rstrip("/") in allowed:
+        return True
+    referer = request.headers.get("referer")
+    if referer and any(referer.startswith(o) for o in allowed):
+        return True
+    return False
+
+
+def get_viewer(
+    request: Request,
+    raw_key: Optional[str] = Security(API_KEY_HEADER),
+    db: Session = Depends(get_db),
+) -> Optional[Tuple[APIUser, APIKey]]:
+    """Read-access dependency.
+
+    - Requests from the web app (browser) are allowed WITHOUT a key, so anyone
+      can browse and page through the data with no restriction.
+    - Direct/programmatic API calls still require a valid API key (and get
+      rate-limited + logged).
+    """
+    if _is_web_request(request):
+        # Web app: key optional. If one is supplied, honor it (for logging /
+        # rate limits), but never block browsing on it.
+        if raw_key:
+            try:
+                return get_current_user(request, raw_key, db)
+            except HTTPException:
+                return None
+        return None
+    # No web origin -> treat as API consumer -> require a valid key.
+    return get_current_user(request, raw_key, db)

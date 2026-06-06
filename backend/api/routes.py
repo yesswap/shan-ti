@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import or_, func, and_
 
 from database import get_db
-from core.auth import get_current_user
+from core.auth import get_viewer
 from models import (
     ThreatActor, Indicator, TTP, MalwareFamily, Campaign,
     IndicatorType, IndicatorStatus, ConfidenceLevel
@@ -141,7 +141,7 @@ def list_actors(
     active_status: Optional[str] = Query(None),
     sector: Optional[str] = Query(None),
     search: Optional[str] = Query(None, min_length=2),
-    auth=Depends(get_current_user),
+    auth=Depends(get_viewer),
     db: Session = Depends(get_db),
 ):
     """List all threat actors with optional filters."""
@@ -191,7 +191,7 @@ def list_actors(
 
 
 @router.get("/actors/{actor_id}", response_model=ActorDetail)
-def get_actor(actor_id: int, auth=Depends(get_current_user), db: Session = Depends(get_db)):
+def get_actor(actor_id: int, auth=Depends(get_viewer), db: Session = Depends(get_db)):
     """Full actor profile with TTPs and malware families."""
     actor = (
         db.query(ThreatActor)
@@ -248,7 +248,7 @@ def get_actor_indicators(
     ioc_type: Optional[str] = Query(None),
     status: Optional[str] = Query(None, description="fresh|stale|expired"),
     include_expired: bool = Query(False),
-    auth=Depends(get_current_user),
+    auth=Depends(get_viewer),
     db: Session = Depends(get_db),
 ):
     """All indicators associated with a threat actor."""
@@ -275,7 +275,7 @@ def get_actor_indicators(
 
 
 @router.get("/actors/{actor_id}/ttps", response_model=List[TTPOut])
-def get_actor_ttps(actor_id: int, auth=Depends(get_current_user), db: Session = Depends(get_db)):
+def get_actor_ttps(actor_id: int, auth=Depends(get_viewer), db: Session = Depends(get_db)):
     """ATT&CK techniques used by the actor."""
     ttps = db.query(TTP).filter(TTP.actor_id == actor_id).order_by(TTP.tactic, TTP.technique_id).all()
     return [TTPOut(
@@ -297,7 +297,7 @@ def list_indicators(
     status: Optional[str] = Query(None),
     confidence: Optional[str] = Query(None),
     include_expired: bool = Query(False),
-    auth=Depends(get_current_user),
+    auth=Depends(get_viewer),
     db: Session = Depends(get_db),
 ):
     q = db.query(Indicator)
@@ -326,7 +326,7 @@ def list_indicators(
 
 
 @router.get("/indicators/pivot/{value}")
-def pivot_indicator(value: str, auth=Depends(get_current_user), db: Session = Depends(get_db)):
+def pivot_indicator(value: str, auth=Depends(get_viewer), db: Session = Depends(get_db)):
     """
     Given any IOC value — find all linked actors, campaigns, and related IOCs.
     The "pivot" feature: from any indicator, jump to everything connected.
@@ -373,7 +373,7 @@ def pivot_indicator(value: str, auth=Depends(get_current_user), db: Session = De
 @router.get("/search")
 def search(
     q: str = Query(..., min_length=2, description="Search actors, IOCs, malware, CVEs"),
-    auth=Depends(get_current_user),
+    auth=Depends(get_viewer),
     db: Session = Depends(get_db),
 ):
     """Cross-entity search across actors, indicators, and malware."""
@@ -407,7 +407,7 @@ def search(
 # ─── Stats ────────────────────────────────────────────────────────────────────
 
 @router.get("/stats")
-def get_stats(auth=Depends(get_current_user), db: Session = Depends(get_db)):
+def get_stats(auth=Depends(get_viewer), db: Session = Depends(get_db)):
     """Platform-wide statistics."""
     actor_count = db.query(func.count(ThreatActor.id)).scalar()
     indicator_count = db.query(func.count(Indicator.id)).scalar()
