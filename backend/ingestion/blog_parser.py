@@ -172,7 +172,12 @@ def extract_iocs(text: str) -> dict[IndicatorType, list[str]]:
     # URLs (only suspicious-looking ones, skip news/social URLs)
     for match in RE_URL.finditer(text):
         url = match.group()
-        domain = urlparse(url).netloc.replace("www.", "")
+        try:
+            domain = urlparse(url).netloc.replace("www.", "")
+        except ValueError:
+            # Defanged / placeholder hosts (e.g. "actor-controlled-ip") break
+            # Python 3.11's stricter bracketed-netloc validation — skip them.
+            continue
         root = ".".join(domain.split(".")[-2:]) if domain else ""
         if root not in BENIGN_DOMAINS:
             results[IndicatorType.URL].add(url[:500])

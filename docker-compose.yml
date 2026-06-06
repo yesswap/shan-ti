@@ -1,0 +1,43 @@
+name: threatlens
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: threatlens
+    volumes:
+      - tl_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d threatlens"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # No host port published — internal only (host 5432 is already in use)
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql://postgres:password@db:5432/threatlens
+      APP_URL: http://localhost:3000
+      CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      # SMTP intentionally unset -> email service runs in dev "print to log" mode
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000/api/v1
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  tl_pgdata:
