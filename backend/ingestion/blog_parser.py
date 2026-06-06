@@ -43,7 +43,7 @@ except Exception:
     logging.warning("spaCy model not available — skipping NER")
 
 from sqlalchemy.orm import Session
-from models import ThreatActor, Indicator, IngestSource, IndicatorType, ConfidenceLevel, IndicatorStatus
+from models import ThreatActor, Indicator, IngestSource, IndicatorType, ConfidenceLevel, IndicatorStatus, MalwareFamily
 
 logger = logging.getLogger(__name__)
 
@@ -63,16 +63,34 @@ RE_CVE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
 RE_EMAIL = re.compile(r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b")
 RE_URL = re.compile(r"https?://[^\s\"'<>]{10,}", re.IGNORECASE)
 
-# Private / reserved IPs to exclude
+# Private / reserved / non-routable IPs to exclude (also filters most
+# version-string false positives that land in reserved first-octet ranges)
 PRIVATE_IP_PATTERNS = re.compile(
-    r"^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.|0\.|255\.)"
+    r"^("
+    r"0\.|10\.|127\.|"
+    r"169\.254\.|"                                  # link-local (incl. AWS metadata)
+    r"172\.(1[6-9]|2\d|3[01])\.|"                    # 172.16/12
+    r"192\.168\.|"
+    r"100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|"      # 100.64/10 CGNAT
+    r"198\.1[89]\.|"                                 # 198.18/15 benchmarking
+    r"22[4-9]\.|23\d\.|"                             # 224-239 multicast
+    r"24\d\.|25[0-5]\."                              # 240-255 reserved
+    r")"
 )
 
-# Common benign domains to exclude
+# Common benign / infrastructure domains to exclude (incl. the intel sources
+# themselves, which would otherwise be ingested as IOCs)
 BENIGN_DOMAINS = {
-    "microsoft.com", "google.com", "github.com", "amazon.com", "cloudflare.com",
-    "windows.com", "office.com", "azure.com", "twitter.com", "linkedin.com",
-    "facebook.com", "apple.com", "mozilla.org", "w3.org", "adobe.com",
+    "microsoft.com", "google.com", "github.com", "githubusercontent.com",
+    "amazon.com", "cloudflare.com", "trycloudflare.com", "windows.com",
+    "office.com", "azure.com", "twitter.com", "linkedin.com", "facebook.com",
+    "apple.com", "mozilla.org", "w3.org", "adobe.com", "youtube.com",
+    "wordpress.com", "blogspot.com", "archive.org", "virustotal.com",
+    "schema.org", "mitre.org", "t.me", "bit.ly",
+    # Threat-intel publishers (sources, not indicators)
+    "thedfirreport.com", "mandiant.com", "paloaltonetworks.com",
+    "secureworks.com", "cisa.gov", "krebsonsecurity.com", "welivesecurity.com",
+    "eset.com",
 }
 
 APT_PATTERN = re.compile(
@@ -218,11 +236,66 @@ def _find_actor(db: Session, mentions: list[str]) -> Optional[ThreatActor]:
     return None
 
 
+def build_resolution_index(db: Session) -> dict:
+    """
+    Precompute lookups used to attribute IOCs to actors (built once per run):
+      - actor_by_name: {normalized name/alias -> actor_id}
+      - malware_re:    compiled regex matching any known malware family name
+      - malware_to_actor: {normalized malware name -> actor_id}
+    Malware names give a second attribution path: an article that names a known
+    malware family ("Cobalt Strike", "PlugX") links its IOCs to that malware's actor.
+    """
+    actor_by_name: dict[str, int] = {}
+    for actor in db.query(ThreatActor).all():
+        for name in [actor.name] + list(actor.aliases or []):
+            n = " ".join((name or "").lower().split())
+            if n:
+                actor_by_name.setdefault(n, actor.id)
+
+    malware_to_actor: dict[str, int] = {}
+    for m in db.query(MalwareFamily).filter(MalwareFamily.actor_id.isnot(None)).all():
+        for name in [m.name] + list(m.aliases or []):
+            n = " ".join((name or "").lower().split())
+            # require some specificity to avoid generic-word false positives
+            if len(n) >= 5 and n not in malware_to_actor:
+                malware_to_actor[n] = m.actor_id
+
+    malware_re = None
+    if malware_to_actor:
+        names = sorted(malware_to_actor.keys(), key=len, reverse=True)
+        malware_re = re.compile(
+            r"\b(" + "|".join(re.escape(n) for n in names) + r")\b", re.IGNORECASE
+        )
+
+    return {
+        "actor_by_name": actor_by_name,
+        "malware_to_actor": malware_to_actor,
+        "malware_re": malware_re,
+    }
+
+
+def resolve_actor(text: str, mentions: list[str], idx: dict) -> Optional[int]:
+    """Return an actor_id for an article via actor-name mentions, else malware names."""
+    # 1) Direct actor name / alias mention
+    for mention in mentions:
+        aid = idx["actor_by_name"].get(" ".join(mention.lower().split()))
+        if aid:
+            return aid
+    # 2) Known malware family named in the article -> its actor
+    mre = idx.get("malware_re")
+    if mre:
+        match = mre.search(text)
+        if match:
+            return idx["malware_to_actor"].get(match.group(1).lower())
+    return None
+
+
 # ─── Main ingestion ───────────────────────────────────────────────────────────
 
-def ingest_blog_feeds(db: Session, max_articles_per_feed: int = 5):
+def ingest_blog_feeds(db: Session, max_articles_per_feed: int = 12):
     """Iterate all threat intel RSS feeds, parse articles, extract and store IOCs."""
     total_iocs = 0
+    resolution_idx = build_resolution_index(db)
 
     for feed_config in THREAT_FEEDS:
         feed_name = feed_config["name"]
@@ -258,7 +331,7 @@ def ingest_blog_feeds(db: Session, max_articles_per_feed: int = 5):
 
             iocs = extract_iocs(text)
             actor_mentions = extract_actor_mentions(text)
-            actor = _find_actor(db, actor_mentions)
+            actor_id = resolve_actor(text, actor_mentions, resolution_idx)
 
             now = datetime.now(timezone.utc)
 
@@ -275,11 +348,11 @@ def ingest_blog_feeds(db: Session, max_articles_per_feed: int = 5):
                         existing.corroboration_count += 1
                         existing.last_seen = now
                         existing.status = IndicatorStatus.FRESH
-                        if actor and not existing.actor_id:
-                            existing.actor_id = actor.id
+                        if actor_id and not existing.actor_id:
+                            existing.actor_id = actor_id
                     else:
                         db.add(Indicator(
-                            actor_id=actor.id if actor else None,
+                            actor_id=actor_id,
                             type=ioc_type,
                             value=value,
                             confidence=ConfidenceLevel.LOW,

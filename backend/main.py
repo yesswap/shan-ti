@@ -10,6 +10,7 @@ Startup sequence:
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -63,6 +64,34 @@ def run_aging():
         db.close()
 
 
+def run_actor_enrichment():
+    """Enrich actors from MISP Galaxy + Malpedia, backfill metadata, then rescore."""
+    from ingestion.misp_galaxy import ingest_misp_galaxy
+    from ingestion.malpedia import ingest_malpedia
+    from intelligence.enrich import enrich_metadata
+    from intelligence.confidence import run_corroboration
+    db = next(get_db())
+    try:
+        ingest_misp_galaxy(db)
+        ingest_malpedia(db)
+        enrich_metadata(db)
+        run_corroboration(db)
+    finally:
+        db.close()
+
+
+def run_blog_then_corroborate():
+    """Ingest IOCs from blogs, then recompute confidence over the new evidence."""
+    from ingestion.blog_parser import ingest_blog_feeds
+    from intelligence.confidence import run_corroboration
+    db = next(get_db())
+    try:
+        ingest_blog_feeds(db)
+        run_corroboration(db)
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ── Startup ──────────────────────────────────────────────────────────────
@@ -77,16 +106,22 @@ async def lifespan(app: FastAPI):
     db.close()
 
     if actor_count == 0:
-        logger.info("Empty DB — running initial MITRE ATT&CK ingestion...")
+        logger.info("Empty DB — seeding MITRE ATT&CK + enrichment sources...")
         run_mitre_ingestion()
+        run_actor_enrichment()  # MISP Galaxy + Malpedia + metadata backfill + corroboration
+        # IOC ingestion from blogs is slower — run it once in the background
+        # (threadpool) so the API starts serving immediately.
+        scheduler.add_job(run_blog_then_corroborate, "date", run_date=datetime.now(), id="seed_blogs")
 
     # Schedule jobs
     # MITRE: weekly (data doesn't change often)
     scheduler.add_job(run_mitre_ingestion, CronTrigger(day_of_week="sun", hour=2), id="mitre")
+    # Actor enrichment (MISP/Malpedia/metadata/corroboration): weekly, after MITRE
+    scheduler.add_job(run_actor_enrichment, CronTrigger(day_of_week="sun", hour=3), id="enrichment")
     # OTX: every 6 hours
     scheduler.add_job(run_otx_ingestion, CronTrigger(hour="*/6"), id="otx")
-    # Blog parser: every 12 hours
-    scheduler.add_job(run_blog_parser, CronTrigger(hour="*/12"), id="blogs")
+    # Blog parser + corroboration: every 12 hours
+    scheduler.add_job(run_blog_then_corroborate, CronTrigger(hour="*/12"), id="blogs")
     # Aging: daily at 3am
     scheduler.add_job(run_aging, CronTrigger(hour=3), id="aging")
 

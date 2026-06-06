@@ -17,6 +17,7 @@ services:
     # No host port published — internal only (host 5432 is already in use)
 
   backend:
+    image: ${IMAGE_PREFIX:-threatlens}/backend:${TAG:-latest}
     build: ./backend
     environment:
       DATABASE_URL: postgresql://postgres:password@db:5432/threatlens
@@ -30,10 +31,11 @@ services:
         condition: service_healthy
 
   frontend:
+    image: ${IMAGE_PREFIX:-threatlens}/frontend:${TAG:-latest}
     build:
       context: ./frontend
       args:
-        NEXT_PUBLIC_API_URL: http://localhost:8000/api/v1
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000/api/v1}
     ports:
       - "3000:3000"
     depends_on:
